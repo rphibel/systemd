@@ -67,6 +67,8 @@ static const UnitActiveState state_translation_table[_SERVICE_STATE_MAX] = {
         [SERVICE_FAILED] = UNIT_FAILED,
         [SERVICE_AUTO_RESTART] = UNIT_ACTIVATING,
         [SERVICE_CLEANING] = UNIT_MAINTENANCE,
+        [SERVICE_FAILED_BEFORE_AUTO_RESTART] = UNIT_FAILED,
+        [SERVICE_DEAD_BEFORE_RESTART] = UNIT_INACTIVE,
 };
 
 /* For Type=idle we never want to delay any other jobs, hence we
@@ -93,6 +95,8 @@ static const UnitActiveState state_translation_table_idle[_SERVICE_STATE_MAX] = 
         [SERVICE_FAILED] = UNIT_FAILED,
         [SERVICE_AUTO_RESTART] = UNIT_ACTIVATING,
         [SERVICE_CLEANING] = UNIT_MAINTENANCE,
+        [SERVICE_FAILED_BEFORE_AUTO_RESTART] = UNIT_FAILED,
+        [SERVICE_DEAD_BEFORE_RESTART] = UNIT_INACTIVE,
 };
 
 static int service_dispatch_inotify_io(sd_event_source *source, int fd, uint32_t events, void *userdata);
@@ -1879,6 +1883,13 @@ static void service_enter_dead(Service *s, ServiceResult f, bool allow_restart) 
                                         reason);
                 if (shall_restart)
                         s->will_auto_restart = true;
+        }
+
+        if (s->will_auto_restart) {
+                if (end_state == SERVICE_FAILED)
+                        end_state = SERVICE_FAILED_BEFORE_AUTO_RESTART;
+                else if (end_state == SERVICE_DEAD)
+                        end_state = SERVICE_DEAD_BEFORE_RESTART;
         }
 
         /* Make sure service_release_resources() doesn't destroy our FD store, while we are changing through
