@@ -813,6 +813,8 @@ Unit* unit_free(Unit *u) {
 
         activation_details_unref(u->activation_details);
 
+        hashmap_free_free(u->cgroup_control_inotify_path);
+
         return mfree(u);
 }
 
@@ -6173,3 +6175,22 @@ int activation_details_append_pair(ActivationDetails *details, char ***strv) {
 }
 
 DEFINE_TRIVIAL_REF_UNREF_FUNC(ActivationDetails, activation_details, activation_details_free);
+
+int unit_add_cgroup_path_for_wd(Unit *u, int wd, char *cgroup_path) {
+        assert(u);
+        assert(wd >= 0);
+        assert(cgroup_path);
+
+        char *cgroup_path_copy = strdup(cgroup_path);
+        if (!cgroup_path_copy)
+                return log_oom();
+
+        return hashmap_ensure_put(&u->cgroup_control_inotify_path, NULL, INT_TO_PTR(wd), cgroup_path_copy);
+}
+
+char *unit_get_cgroup_path_for_wd(Unit *u, int wd) {
+        assert(u);
+        assert(wd >= 0);
+
+        return (char *)hashmap_get(u->cgroup_control_inotify_path, INT_TO_PTR(wd));
+}

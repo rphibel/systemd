@@ -2186,6 +2186,10 @@ int unit_watch_cgroup(Unit *u) {
         if (r < 0)
                 return log_unit_error_errno(u, r, "Failed to add control inotify watch descriptor for control group %s to hash map: %m", empty_to_root(u->cgroup_path));
 
+        r = unit_add_cgroup_path_for_wd(u, u->cgroup_control_inotify_wd, u->cgroup_path);
+        if (r < 0)
+                return log_unit_error_errno(u, r, "Failed to add control group path %s to hash map: %m", empty_to_root(u->cgroup_path));
+
         return 0;
 }
 
@@ -2922,6 +2926,28 @@ bool unit_maybe_release_cgroup(Unit *u) {
         return false;
 }
 
+static int unit_transfer_cgroup_wd_to_parent(Unit *u) {
+        Unit *s;
+        int r;
+
+        assert(u);
+
+        s = UNIT_GET_SLICE(u);
+        if (s) {
+                int wd = u->cgroup_control_inotify_wd;
+                (void) hashmap_remove(u->manager->cgroup_control_inotify_wd_unit, INT_TO_PTR(wd));
+                r = hashmap_put(s->manager->cgroup_control_inotify_wd_unit, INT_TO_PTR(wd), s);
+                if (r < 0)
+                        return r;
+
+                r = unit_add_cgroup_path_for_wd(s, wd, u->cgroup_path);
+                if (r < 0)
+                        return r;
+        }
+
+        return 0;
+}
+
 void unit_prune_cgroup(Unit *u) {
         int r;
         bool is_root_slice;
@@ -2942,13 +2968,15 @@ void unit_prune_cgroup(Unit *u) {
         is_root_slice = unit_has_name(u, SPECIAL_ROOT_SLICE);
 
         r = cg_trim_everywhere(u->manager->cgroup_supported, u->cgroup_path, !is_root_slice);
-        if (r < 0)
+        if (r < 0) {
                 /* One reason we could have failed here is, that the cgroup still contains a process.
                  * However, if the cgroup becomes removable at a later time, it might be removed when
                  * the containing slice is stopped. So even if we failed now, this unit shouldn't assume
                  * that the cgroup is still realized the next time it is started. Do not return early
                  * on error, continue cleanup. */
                 log_unit_full_errno(u, r == -EBUSY ? LOG_DEBUG : LOG_WARNING, r, "Failed to destroy cgroup %s, ignoring: %m", empty_to_root(u->cgroup_path));
+                (void) unit_transfer_cgroup_wd_to_parent(u);
+        }
 
         if (is_root_slice)
                 return;
@@ -3343,36 +3371,51 @@ static void unit_add_to_cgroup_oom_queue(Unit *u) {
                 log_error_errno(r, "Failed to enable cgroup oom event source: %m");
 }
 
-static int unit_check_cgroup_events(Unit *u) {
+static int unit_check_cgroup_events(Unit *u, char *cgroup_path) {
         char *values[2] = {};
         int r;
 
         assert(u);
 
-        if (!u->cgroup_path)
+        if (!cgroup_path)
                 return 0;
 
-        r = cg_get_keyed_attribute_graceful(SYSTEMD_CGROUP_CONTROLLER, u->cgroup_path, "cgroup.events",
+        r = cg_get_keyed_attribute_graceful(SYSTEMD_CGROUP_CONTROLLER, cgroup_path, "cgroup.events",
                                             STRV_MAKE("populated", "frozen"), values);
         if (r < 0)
                 return r;
 
-        /* The cgroup.events notifications can be merged together so act as we saw the given state for the
-         * first time. The functions we call to handle given state are idempotent, which makes them
-         * effectively remember the previous state. */
-        if (values[0]) {
-                if (streq(values[0], "1"))
-                        unit_remove_from_cgroup_empty_queue(u);
-                else
-                        unit_add_to_cgroup_empty_queue(u);
-        }
+        if (!streq(cgroup_path, u->cgroup_path)) {
+                /* We are processing the events of a cgroup that is not the current unit cgroup.
+                 * This can happen if watch descriptors of the cgroup were transfered to the parent slice
+                 * when the unit was deactivated because the unit failed to destroy the cgroup.
+                 */
+                r = cg_trim_everywhere(u->manager->cgroup_supported, cgroup_path, true);
+                if (r < 0)
+                        /* One reason we could have failed here is, that the cgroup still contains a process.
+                        * However, if the cgroup becomes removable at a later time, it might be removed when
+                        * the containing slice is stopped. So even if we failed now, this unit shouldn't assume
+                        * that the cgroup is still realized the next time it is started. Do not return early
+                        * on error, continue cleanup. */
+                        log_unit_full_errno(u, r == -EBUSY ? LOG_DEBUG : LOG_WARNING, r, "Failed to destroy cgroup %s, ignoring: %m", empty_to_root(cgroup_path));
+        } else {
+                /* The cgroup.events notifications can be merged together so act as we saw the given state for the
+                * first time. The functions we call to handle given state are idempotent, which makes them
+                * effectively remember the previous state. */
+                if (values[0]) {
+                        if (streq(values[0], "1"))
+                                unit_remove_from_cgroup_empty_queue(u);
+                        else
+                                unit_add_to_cgroup_empty_queue(u);
+                }
 
-        /* Disregard freezer state changes due to operations not initiated by us */
-        if (values[1] && IN_SET(u->freezer_state, FREEZER_FREEZING, FREEZER_THAWING)) {
-                if (streq(values[1], "0"))
-                        unit_thawed(u);
-                else
-                        unit_frozen(u);
+                /* Disregard freezer state changes due to operations not initiated by us */
+                if (values[1] && IN_SET(u->freezer_state, FREEZER_FREEZING, FREEZER_THAWING)) {
+                        if (streq(values[1], "0"))
+                                unit_thawed(u);
+                        else
+                                unit_frozen(u);
+                }
         }
 
         free(values[0]);
@@ -3414,8 +3457,11 @@ static int on_cgroup_inotify_event(sd_event_source *s, int fd, uint32_t revents,
                          * because it was queued before the removal. Let's ignore this here safely. */
 
                         u = hashmap_get(m->cgroup_control_inotify_wd_unit, INT_TO_PTR(e->wd));
-                        if (u)
-                                unit_check_cgroup_events(u);
+                        if (u) {
+                                char *cgroup_path = unit_get_cgroup_path_for_wd(u, e->wd);
+                                if (cgroup_path)
+                                        unit_check_cgroup_events(u, cgroup_path);
+                        }
 
                         u = hashmap_get(m->cgroup_memory_inotify_wd_unit, INT_TO_PTR(e->wd));
                         if (u)
@@ -4208,7 +4254,7 @@ void unit_cgroup_catchup(Unit *u) {
          * Note that (currently) the kernel doesn't actually update cgroup
          * file modification times, so we can't just serialize and then check
          * the mtime for file(s) we are interested in. */
-        (void) unit_check_cgroup_events(u);
+        (void) unit_check_cgroup_events(u, u->cgroup_path);
         unit_add_to_cgroup_oom_queue(u);
 }
 
