@@ -669,6 +669,36 @@ static void unit_done(Unit *u) {
                 cgroup_context_done(cc);
 }
 
+static int unit_transfer_cgroup_wds_to_parent_slice(Unit *u, Unit *slice) {
+        char *cgroup_path;
+        void *key;
+        int r;
+
+        assert(u);
+
+        if (!slice)
+                return 0;
+
+        HASHMAP_FOREACH_KEY(cgroup_path, key, u->cgroup_control_inotify_path) {
+                int wd = PTR_TO_INT(key);
+                log_unit_debug(u, "DEBUGRP Transfering watch descriptor (wd=%d, cgroup_path=%s) to parent %s", wd, cgroup_path, slice->id);
+                (void) hashmap_remove(u->manager->cgroup_control_inotify_wd_unit, key);
+                r = hashmap_put(slice->manager->cgroup_control_inotify_wd_unit, key, slice);
+                if (r < 0)
+                        return r;
+
+                r = unit_add_cgroup_path_for_wd(slice, PTR_TO_INT(key), cgroup_path);
+                if (r < 0)
+                        return r;
+
+                if (u->cgroup_path && streq(cgroup_path, u->cgroup_path))
+                        /* This prevents the inotify watch from being removed in unit_release_cgroup */
+                        u->cgroup_control_inotify_wd = -1;
+        }
+
+        return 0;
+}
+
 Unit* unit_free(Unit *u) {
         Unit *slice;
         char *t;
@@ -729,6 +759,8 @@ Unit* unit_free(Unit *u) {
         bpf_link_free(u->ipv4_socket_bind_link);
         bpf_link_free(u->ipv6_socket_bind_link);
 #endif
+
+        (void) unit_transfer_cgroup_wds_to_parent_slice(u, slice);
 
         unit_release_cgroup(u);
 
@@ -812,6 +844,8 @@ Unit* unit_free(Unit *u) {
         free(u->id);
 
         activation_details_unref(u->activation_details);
+
+        hashmap_free_free(u->cgroup_control_inotify_path);
 
         return mfree(u);
 }
@@ -6173,3 +6207,44 @@ int activation_details_append_pair(ActivationDetails *details, char ***strv) {
 }
 
 DEFINE_TRIVIAL_REF_UNREF_FUNC(ActivationDetails, activation_details, activation_details_free);
+
+int unit_add_cgroup_path_for_wd(Unit *u, int wd, char *cgroup_path) {
+        assert(u);
+        assert(wd >= 0);
+        assert(cgroup_path);
+
+        char *cgroup_path_copy = strdup(cgroup_path);
+        if (!cgroup_path_copy)
+                return log_oom();
+
+        log_unit_debug(u, "DEBUGRP Adding watch descriptor (wd=%d, cgroup_path=%s) to cgroup_control_inotify_path hashmap", wd, cgroup_path);
+        return hashmap_ensure_put(&u->cgroup_control_inotify_path, NULL, INT_TO_PTR(wd), cgroup_path_copy);
+}
+
+char *unit_get_cgroup_path_for_wd(Unit *u, int wd) {
+        assert(u);
+        assert(wd >= 0);
+
+        return (char *)hashmap_get(u->cgroup_control_inotify_path, INT_TO_PTR(wd));
+}
+
+void unit_remove_cgroup_wd(Unit *u, char *cgroup_path) {
+        char *path;
+        void* key;
+
+        assert(u);
+
+        HASHMAP_FOREACH_KEY(path, key, u->cgroup_control_inotify_path) {
+                if (streq(path, cgroup_path)) {
+                        int wd = PTR_TO_INT(key);
+                        log_unit_debug(u, "DEBUGRP Removing watch descriptor (wd=%d, cgroup_path=%s) from cgroup_control_inotify_path hashmap", wd, cgroup_path);
+                        (void) hashmap_remove(u->cgroup_control_inotify_path, key);
+                        free(path);
+                        if (inotify_rm_watch(u->manager->cgroup_inotify_fd, wd) < 0)
+                                log_unit_debug_errno(u, errno, "Failed to remove cgroup control inotify watch %i for %s, ignoring: %m", wd, u->id);
+
+                        (void) hashmap_remove(u->manager->cgroup_control_inotify_wd_unit, key);
+                        break;
+                }
+        }
+}

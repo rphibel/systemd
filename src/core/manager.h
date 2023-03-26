@@ -140,6 +140,15 @@ typedef enum ManagerTestRunFlags {
 
 assert_cc((MANAGER_TEST_FULL & UINT8_MAX) == MANAGER_TEST_FULL);
 
+typedef struct CgroupEmptyQueueItem CgroupEmptyQueueItem;
+
+struct CgroupEmptyQueueItem {
+        int wd;
+
+        /* cgroup empty queue */
+        LIST_FIELDS(CgroupEmptyQueueItem, new_cgroup_empty_queue);
+};
+
 struct Manager {
         /* Note that the set of units we know of is allowed to be
          * inconsistent. However the subset of it that is loaded may
@@ -179,6 +188,9 @@ struct Manager {
 
         /* Units whose cgroup ran empty */
         LIST_HEAD(Unit, cgroup_empty_queue);
+
+        /* Units whose cgroup ran empty */
+        LIST_HEAD(CgroupEmptyQueueItem, new_cgroup_empty_queue);
 
         /* Units whose memory.event fired */
         LIST_HEAD(Unit, cgroup_oom_queue);

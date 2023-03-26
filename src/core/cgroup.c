@@ -2186,6 +2186,10 @@ int unit_watch_cgroup(Unit *u) {
         if (r < 0)
                 return log_unit_error_errno(u, r, "Failed to add control inotify watch descriptor for control group %s to hash map: %m", empty_to_root(u->cgroup_path));
 
+        r = unit_add_cgroup_path_for_wd(u, u->cgroup_control_inotify_wd, u->cgroup_path);
+        if (r < 0)
+                return log_unit_error_errno(u, r, "Failed to add control group path %s to hash map: %m", empty_to_root(u->cgroup_path));
+
         return 0;
 }
 
@@ -2949,6 +2953,8 @@ void unit_prune_cgroup(Unit *u) {
                  * that the cgroup is still realized the next time it is started. Do not return early
                  * on error, continue cleanup. */
                 log_unit_full_errno(u, r == -EBUSY ? LOG_DEBUG : LOG_WARNING, r, "Failed to destroy cgroup %s, ignoring: %m", empty_to_root(u->cgroup_path));
+        else
+                unit_remove_cgroup_wd(u, u->cgroup_path);
 
         if (is_root_slice)
                 return;
@@ -3073,7 +3079,7 @@ int unit_synthesize_cgroup_empty_event(Unit *u) {
         if (!set_isempty(u->pids))
                 return 0;
 
-        unit_add_to_cgroup_empty_queue(u);
+        unit_add_to_cgroup_empty_queue(u, u->cgroup_control_inotify_wd);
         return 0;
 }
 
@@ -3133,10 +3139,12 @@ static int on_cgroup_empty_event(sd_event_source *s, void *userdata) {
         return 0;
 }
 
-void unit_add_to_cgroup_empty_queue(Unit *u) {
+void unit_add_to_cgroup_empty_queue(Unit *u, int wd) {
+        char *cgroup_path;
         int r;
 
         assert(u);
+        assert(wd >= 0);
 
         /* Note that there are four different ways how cgroup empty events reach us:
          *
@@ -3159,12 +3167,13 @@ void unit_add_to_cgroup_empty_queue(Unit *u) {
                 return;
 
         /* Let's verify that the cgroup is really empty */
-        if (!u->cgroup_path)
+        cgroup_path = unit_get_cgroup_path_for_wd(u, wd);
+        if (!cgroup_path)
                 return;
 
-        r = cg_is_empty_recursive(SYSTEMD_CGROUP_CONTROLLER, u->cgroup_path);
+        r = cg_is_empty_recursive(SYSTEMD_CGROUP_CONTROLLER, cgroup_path);
         if (r < 0) {
-                log_unit_debug_errno(u, r, "Failed to determine whether cgroup %s is empty: %m", empty_to_root(u->cgroup_path));
+                log_unit_debug_errno(u, r, "Failed to determine whether cgroup %s is empty: %m", empty_to_root(cgroup_path));
                 return;
         }
         if (r == 0)
@@ -3172,6 +3181,11 @@ void unit_add_to_cgroup_empty_queue(Unit *u) {
 
         LIST_PREPEND(cgroup_empty_queue, u->manager->cgroup_empty_queue, u);
         u->in_cgroup_empty_queue = true;
+
+        CgroupEmptyQueueItem *item;
+        item = new0(CgroupEmptyQueueItem, 1);
+        item->wd = wd;
+        LIST_PREPEND(new_cgroup_empty_queue, u->manager->new_cgroup_empty_queue, item);
 
         /* Trigger the defer event */
         r = sd_event_source_set_enabled(u->manager->cgroup_empty_event_source, SD_EVENT_ONESHOT);
@@ -3343,36 +3357,56 @@ static void unit_add_to_cgroup_oom_queue(Unit *u) {
                 log_error_errno(r, "Failed to enable cgroup oom event source: %m");
 }
 
-static int unit_check_cgroup_events(Unit *u) {
+static int unit_check_cgroup_events(Unit *u, int wd) {
         char *values[2] = {};
+        char *cgroup_path;
         int r;
 
         assert(u);
+        assert(wd >= 0);
 
-        if (!u->cgroup_path)
+        cgroup_path = unit_get_cgroup_path_for_wd(u, wd);
+        if (!cgroup_path)
                 return 0;
 
-        r = cg_get_keyed_attribute_graceful(SYSTEMD_CGROUP_CONTROLLER, u->cgroup_path, "cgroup.events",
+        r = cg_get_keyed_attribute_graceful(SYSTEMD_CGROUP_CONTROLLER, cgroup_path, "cgroup.events",
                                             STRV_MAKE("populated", "frozen"), values);
         if (r < 0)
                 return r;
 
-        /* The cgroup.events notifications can be merged together so act as we saw the given state for the
-         * first time. The functions we call to handle given state are idempotent, which makes them
-         * effectively remember the previous state. */
-        if (values[0]) {
-                if (streq(values[0], "1"))
-                        unit_remove_from_cgroup_empty_queue(u);
+        if (!streq(cgroup_path, u->cgroup_path)) {
+                /* We are processing the events of a cgroup that is not the current unit cgroup.
+                 * This can happen if watch descriptors of the cgroup were transfered to the parent slice
+                 * when the unit was deactivated because the unit failed to destroy the cgroup.
+                 */
+                r = cg_trim_everywhere(u->manager->cgroup_supported, cgroup_path, true);
+                if (r < 0)
+                        /* One reason we could have failed here is, that the cgroup still contains a process.
+                        * However, if the cgroup becomes removable at a later time, it might be removed when
+                        * the containing slice is stopped. So even if we failed now, this unit shouldn't assume
+                        * that the cgroup is still realized the next time it is started. Do not return early
+                        * on error, continue cleanup. */
+                        log_unit_full_errno(u, r == -EBUSY ? LOG_DEBUG : LOG_WARNING, r, "Failed to destroy cgroup %s, ignoring: %m", empty_to_root(cgroup_path));
                 else
-                        unit_add_to_cgroup_empty_queue(u);
-        }
+                        unit_remove_cgroup_wd(u, cgroup_path);
+        } else {
+                /* The cgroup.events notifications can be merged together so act as we saw the given state for the
+                * first time. The functions we call to handle given state are idempotent, which makes them
+                * effectively remember the previous state. */
+                if (values[0]) {
+                        if (streq(values[0], "1"))
+                                unit_remove_from_cgroup_empty_queue(u);
+                        else
+                                unit_add_to_cgroup_empty_queue(u, wd);
+                }
 
-        /* Disregard freezer state changes due to operations not initiated by us */
-        if (values[1] && IN_SET(u->freezer_state, FREEZER_FREEZING, FREEZER_THAWING)) {
-                if (streq(values[1], "0"))
-                        unit_thawed(u);
-                else
-                        unit_frozen(u);
+                /* Disregard freezer state changes due to operations not initiated by us */
+                if (values[1] && IN_SET(u->freezer_state, FREEZER_FREEZING, FREEZER_THAWING)) {
+                        if (streq(values[1], "0"))
+                                unit_thawed(u);
+                        else
+                                unit_frozen(u);
+                }
         }
 
         free(values[0]);
@@ -3402,6 +3436,7 @@ static int on_cgroup_inotify_event(sd_event_source *s, int fd, uint32_t revents,
                 FOREACH_INOTIFY_EVENT_WARN(e, buffer, l) {
                         Unit *u;
 
+                        log_debug("DEBUGRP on_cgroup_inotify_event (wd=%d, ignored=%d)", e->wd, ((e->mask & IN_IGNORED) != 0));
                         if (e->wd < 0)
                                 /* Queue overflow has no watch descriptor */
                                 continue;
@@ -3415,7 +3450,7 @@ static int on_cgroup_inotify_event(sd_event_source *s, int fd, uint32_t revents,
 
                         u = hashmap_get(m->cgroup_control_inotify_wd_unit, INT_TO_PTR(e->wd));
                         if (u)
-                                unit_check_cgroup_events(u);
+                                unit_check_cgroup_events(u, e->wd);
 
                         u = hashmap_get(m->cgroup_memory_inotify_wd_unit, INT_TO_PTR(e->wd));
                         if (u)
@@ -3731,7 +3766,7 @@ int manager_notify_cgroup_empty(Manager *m, const char *cgroup) {
         if (!u)
                 return 0;
 
-        unit_add_to_cgroup_empty_queue(u);
+        unit_add_to_cgroup_empty_queue(u, u->cgroup_control_inotify_wd);
         return 1;
 }
 
@@ -4208,7 +4243,7 @@ void unit_cgroup_catchup(Unit *u) {
          * Note that (currently) the kernel doesn't actually update cgroup
          * file modification times, so we can't just serialize and then check
          * the mtime for file(s) we are interested in. */
-        (void) unit_check_cgroup_events(u);
+        (void) unit_check_cgroup_events(u, u->cgroup_control_inotify_wd);
         unit_add_to_cgroup_oom_queue(u);
 }
 

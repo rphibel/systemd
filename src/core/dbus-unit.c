@@ -2522,7 +2522,7 @@ static int bus_unit_track_handler(sd_bus_track *t, void *userdata) {
 
         /* If the client that tracks us disappeared, then there's reason to believe that the cgroup is empty now too,
          * let's see */
-        unit_add_to_cgroup_empty_queue(u);
+        unit_add_to_cgroup_empty_queue(u, u->cgroup_control_inotify_wd);
 
         /* Also add the unit to the GC queue, after all if the client left it might be time to GC this unit */
         unit_add_to_gc_queue(u);

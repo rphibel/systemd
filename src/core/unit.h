@@ -381,6 +381,7 @@ typedef struct Unit {
         /* Inotify watch descriptors for watching cgroup.events and memory.events on cgroupv2 */
         int cgroup_control_inotify_wd;
         int cgroup_memory_inotify_wd;
+        Hashmap *cgroup_control_inotify_path;
 
         /* Device Controller BPF program */
         BPFProgram *bpf_device_control_installed;
@@ -1071,6 +1072,10 @@ int unit_freeze_vtable_common(Unit *u);
 int unit_thaw_vtable_common(Unit *u);
 
 Condition *unit_find_failed_condition(Unit *u);
+
+int unit_add_cgroup_path_for_wd(Unit *u, int wd, char *cgroup_path);
+char *unit_get_cgroup_path_for_wd(Unit *u, int wd);
+void unit_remove_cgroup_wd(Unit *u, char *cgroup_path);
 
 /* Macros which append UNIT= or USER_UNIT= to the message */
 
