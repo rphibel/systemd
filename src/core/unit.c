@@ -2631,6 +2631,9 @@ void unit_notify(Unit *u, UnitActiveState os, UnitActiveState ns, UnitNotifyFlag
         assert(os < _UNIT_ACTIVE_STATE_MAX);
         assert(ns < _UNIT_ACTIVE_STATE_MAX);
 
+        if (ns == UNIT_ACTIVATING)
+                u->start_count++;
+
         /* Note that this is called for all low-level state changes, even if they might map to the same high-level
          * UnitActiveState! That means that ns == os is an expected behavior here. For example: if a mount point is
          * remounted this function will be called too! */

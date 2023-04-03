@@ -272,6 +272,8 @@ typedef struct UnitStatusInfo {
         uint64_t default_memory_low;
         uint64_t default_startup_memory_low;
 
+        uint64_t start_count;
+
         LIST_HEAD(ExecStatusInfo, exec_status_info_list);
 } UnitStatusInfo;
 
@@ -432,6 +434,7 @@ static void print_status_info(
                 printf("     Active: %s%s%s",
                        active_on, strna(i->active_state), active_off);
 
+
         fs = !isempty(i->freezer_state) && !streq(i->freezer_state, "running") ? i->freezer_state : NULL;
         if (fs)
                 printf(" %s(%s)%s", ansi_highlight_yellow(), fs, ansi_normal());
@@ -470,6 +473,8 @@ static void print_status_info(
                 }
         } else
                 printf("\n");
+
+        printf("     StartCount: %lu\n", i->start_count);
 
         STRV_FOREACH(t, i->triggered_by) {
                 UnitActiveState state = _UNIT_ACTIVE_STATE_INVALID;
@@ -2036,6 +2041,7 @@ static int show_one(
                 { "IPEgressBytes",                  "t",               NULL,           offsetof(UnitStatusInfo, ip_egress_bytes)                   },
                 { "IOReadBytes",                    "t",               NULL,           offsetof(UnitStatusInfo, io_read_bytes)                     },
                 { "IOWriteBytes",                   "t",               NULL,           offsetof(UnitStatusInfo, io_write_bytes)                    },
+                { "StartCount",                     "i",               NULL,           offsetof(UnitStatusInfo, start_count)                      },
                 { "ExecCondition",                  "a(sasbttttuii)",  map_exec,       0                                                           },
                 { "ExecConditionEx",                "a(sasasttttuii)", map_exec,       0                                                           },
                 { "ExecStartPre",                   "a(sasbttttuii)",  map_exec,       0                                                           },
